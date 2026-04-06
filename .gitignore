@@ -5,8 +5,8 @@ __pycache__/
 *.pyd
 .env
 .DS_Store
-data/
-*.csv
+data/*
+!data/superstore.csv
 *.xlsx
 *.parquet
 .streamlit/

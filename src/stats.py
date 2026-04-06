@@ -175,10 +175,10 @@ def calculate_advanced_feature_importance(
     exclude_cols: Optional[Sequence[str]] = None,
     top_k: int = 5,
 ) -> Dict[str, Any]:
-    """Advanced feature importance: normalized variance, correlation penalty, cardinality.
+    """Intelligent feature importance: variance_normalized × completeness × signal_strength for numeric,
+    unique_ratio × frequency_balance_score for categorical.
     
-    Excludes identifier columns from analysis. Applies correlation penalty to avoid
-    multicollinearity and normalizes by max variance to remove scale bias.
+    Excludes identifier columns and near-zero variance columns from analysis.
     """
     exclude_cols = set(exclude_cols or [])
     
@@ -187,24 +187,30 @@ def calculate_advanced_feature_importance(
     else:
         numeric = df.loc[:, [col for col in numeric_cols if col in df.columns and col not in exclude_cols]]
     
-    if numeric.empty:
-        return {"numeric": [], "categorical": [], "excluded_identifiers": list(exclude_cols), "penalty_applied": True}
-    
-    variances = {col: float(numeric[col].var(ddof=0)) for col in numeric.columns}
-    max_var = max(variances.values()) if variances else 1.0
-    normalized_var = {col: v / (max_var + 1e-8) for col, v in variances.items()}
-    
-    corr_matrix = numeric.corr().abs()
-    correlation_penalty = {}
-    for col in numeric.columns:
-        high_corr = (corr_matrix[col] > 0.7).sum() - 1
-        correlation_penalty[col] = max(0, 1.0 - (high_corr * 0.15))
+    # Exclude near-zero variance numeric columns
+    if not numeric.empty:
+        variances = {col: float(numeric[col].var(ddof=0)) for col in numeric.columns}
+        max_var = max(variances.values()) if variances else 1.0
+        numeric = numeric.loc[:, [col for col in numeric.columns if variances[col] > (max_var * 1e-6)]]
     
     numeric_scores = []
-    for col in numeric.columns:
-        non_null_ratio = float(numeric[col].notna().mean())
-        score = normalized_var[col] * non_null_ratio * correlation_penalty[col]
-        numeric_scores.append((col, score))
+    if not numeric.empty:
+        variances = {col: float(numeric[col].var(ddof=0)) for col in numeric.columns}
+        max_var = max(variances.values()) if variances else 1.0
+        normalized_var = {col: v / (max_var + 1e-8) for col, v in variances.items()}
+        
+        # Calculate signal strength: max absolute correlation with other numeric features
+        corr_matrix = numeric.corr().abs()
+        signal_strength = {}
+        for col in numeric.columns:
+            # Max correlation with other columns (exclude self)
+            other_corrs = [corr_matrix.at[col, other] for other in numeric.columns if other != col]
+            signal_strength[col] = max(other_corrs) if other_corrs else 0.0
+        
+        for col in numeric.columns:
+            completeness = float(numeric[col].notna().mean())
+            score = normalized_var[col] * completeness * (1 + signal_strength[col])  # Boost by signal strength
+            numeric_scores.append((col, score))
     
     numeric_scores = sorted(numeric_scores, key=lambda x: x[1], reverse=True)[:top_k]
     
@@ -212,11 +218,29 @@ def calculate_advanced_feature_importance(
     if categorical_cols:
         for col in categorical_cols:
             if col in df.columns and col not in exclude_cols:
-                cardinality = float(df[col].nunique() / len(df))
+                unique_count = df[col].nunique()
+                total_rows = len(df)
+                unique_ratio = unique_count / total_rows
+                
+                # Frequency balance score: normalized entropy (higher = more balanced)
+                if unique_count > 1:
+                    value_counts = df[col].value_counts()
+                    probabilities = value_counts / total_rows
+                    entropy = -sum(p * np.log(p) for p in probabilities)
+                    max_entropy = np.log(unique_count)
+                    frequency_balance_score = entropy / max_entropy if max_entropy > 0 else 0
+                else:
+                    frequency_balance_score = 0
+                
                 completeness = float(df[col].notna().mean())
-                score = cardinality * completeness
+                score = unique_ratio * frequency_balance_score * completeness
                 categorical_scores.append((col, score))
     
     categorical_scores = sorted(categorical_scores, key=lambda x: x[1], reverse=True)[:top_k]
     
-    return {"numeric": numeric_scores, "categorical": categorical_scores, "excluded_identifiers": list(exclude_cols), "penalty_applied": True}
+    return {
+        "numeric": numeric_scores, 
+        "categorical": categorical_scores, 
+        "excluded_identifiers": list(exclude_cols), 
+        "intelligence_applied": True
+    }

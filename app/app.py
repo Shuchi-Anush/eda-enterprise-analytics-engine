@@ -65,17 +65,17 @@ def main() -> None:
 
     print_section("Column Semantics")
     semantics = report.get("column_semantics", {})
-    if semantics.get("identifier"):
+    if semantics.get("identifiers"):
         id_reasons = semantics.get("identifier_reasons", {})
         print("Identifiers (EXCLUDED from analysis):")
-        for col in semantics["identifier"]:
+        for col in semantics["identifiers"]:
             reasons = id_reasons.get(col, [])
             print(f"  - {col}: {', '.join(reasons)}")
     else:
         print("No identifiers detected")
-    metrics = semantics.get("metric", [])
+    metrics = semantics.get("metrics", [])
     print(f"Metrics: {', '.join(metrics) if metrics else 'None'}")
-    dimensions = semantics.get("dimension", [])
+    dimensions = semantics.get("dimensions", [])
     print(f"Dimensions: {', '.join(dimensions) if dimensions else 'None'}")
     target_like = semantics.get("target_like", [])
     print(f"Target-like: {', '.join(target_like) if target_like else 'None'}")

@@ -25,87 +25,204 @@ from .temporal import aggregate_time, detect_trend, rolling_average, detect_temp
 from .preprocessing import infer_column_semantics
 
 
+def classify_dataset(df: pd.DataFrame, schema: dict, semantics: dict) -> str:
+    numeric = semantics.get("metrics", [])
+    categorical = semantics.get("dimensions", [])
+    datetime_cols = semantics.get("temporal", [])
+
+    effective_categorical = [
+        col for col in categorical
+        if col in df.columns and df[col].nunique() < 50
+    ]
+
+    valid_temporal = []
+    for col in datetime_cols:
+        if col not in df.columns:
+            continue
+        parsed = pd.to_datetime(df[col], errors="coerce")
+        if parsed.notna().mean() > 0.5:
+            valid_temporal.append(col)
+
+    if len(numeric) > 0 and len(effective_categorical) == 0 and len(valid_temporal) == 0:
+        return "feature_dataset"
+
+    if len(valid_temporal) > 0 and len(numeric) > 0:
+        return "temporal_dataset"
+
+    if len(effective_categorical) > 0 and len(numeric) > 0:
+        return "analytical_dataset"
+
+    return "unknown"
+
+
 def generate_insights(report: Dict[str, Any]) -> List[str]:
-    """Generate context-aware insights with multi-column reasoning (v4).
-    
-    Includes semantic awareness of identifiers, metrics, and dimensions to provide
-    decision-support recommendations.
-    """
-    insights: List[str] = []
+    """Generate scored insights with impact × confidence prioritization."""
+    insights: List[Dict[str, Any]] = []
     if not report:
         return ["No report generated."]
 
     stats_summary = report.get("stats", {}).get("summary", [])
     duplicates = report.get("duplicates", 0)
     semantics = report.get("column_semantics", {})
-
-    # Signal 0: Identifier columns detected and excluded from analysis
-    identifiers = semantics.get("identifier", [])
-    if identifiers:
-        id_reasons = semantics.get("identifier_reasons", {})
-        reason_strs = []
-        for col in identifiers:
-            reasons = id_reasons.get(col, [])
-            reason_strs.append(f"{col} ({', '.join(reasons)})")
-        insights.append(
-            f"Identifier columns detected and excluded from analysis: {', '.join(reason_strs)}. "
-            "These columns represent row identifiers, not predictive features."
-        )
-
-    # Signal 1: Extreme skewness with transformation guidance
-    heavy_tail_cols = []
-    for row in stats_summary:
-        skew = abs(row.get("skewness", 0.0))
-        outlier_ratio = row.get("outlier_ratio", 0.0)
-        if skew > 1.0 and outlier_ratio > 0.15:
-            heavy_tail_cols.append((row["column"], skew, outlier_ratio))
-    if heavy_tail_cols:
-        top_col = heavy_tail_cols[0]
-        insights.append(
-            f"Extreme skewness in '{top_col[0]}' (skew={top_col[1]:.2f}, outliers={top_col[2]:.0%}). "
-            "Distribution highly asymmetric—consider log transformation or robust scaling."
-        )
-
-    # Signal 2: Negative correlations (margin erosion pattern)
     corr_df = report.get("correlation")
-    neg_pairs = []
-    if isinstance(corr_df, pd.DataFrame) and not corr_df.empty:
-        for i, row in corr_df.iterrows():
-            for j, value in row.items():
-                if i < j and value < -0.6:
-                    neg_pairs.append((i, j, value))
-    if neg_pairs:
-        top_neg = min(neg_pairs, key=lambda x: x[2])
-        insights.append(
-            f"Margin erosion detected: {top_neg[0]} inversely driven by {top_neg[1]} (r={top_neg[2]:.2f}). "
-            "Review pricing or cost dynamics."
-        )
+    dataset_type = report.get("dataset_type", "unknown")
+    total_rows = len(report.get("summary", []))
 
-    # Signal 3: Business concentration risk (dominant categories)
-    dominant_cat = semantics.get("dominant_categories", {})
-    if dominant_cat:
-        top_cat_col = max(dominant_cat.items(), key=lambda x: x[1][1])
-        if top_cat_col[1][1] > 0.5:
-            insights.append(
-                f"Business concentration risk: {top_cat_col[0]} dominated by '{top_cat_col[1][0]}' "
-                f"({top_cat_col[1][1]:.0%}). Diversification recommended."
-            )
+    # Helper to calculate confidence based on data size and statistical strength
+    def calculate_confidence(statistical_strength: float, data_size_factor: float = 1.0) -> float:
+        size_confidence = min(1.0, total_rows / 1000)  # Max confidence at 1000+ rows
+        return min(1.0, statistical_strength * size_confidence * data_size_factor)
 
-    # Signal 4: Data quality issues
+    # Priority 1: Data Quality Issues
     quality_issues = []
     if duplicates > 0:
-        quality_issues.append(f"{duplicates} duplicate rows")
+        quality_issues.append(f"{duplicates} duplicate rows detected")
     missing = report.get("missing", [])
     for row in missing:
         if row.get("missing_ratio", 0.0) >= 0.3:
-            quality_issues.append(f"{row['column']}: {row['missing_ratio']:.0%} missing")
+            quality_issues.append(f"{row['column']}: {row['missing_ratio']:.0%} missing values")
     if quality_issues:
-        insights.append(f"Data quality issues: {', '.join(quality_issues[:1])}. Cleaning required before modeling.")
+        impact = 0.6  # Medium-high impact
+        confidence = calculate_confidence(0.9, 1.0)  # High statistical confidence
+        score = impact * confidence
+        insights.append({
+            "text": f"Data quality issues: {', '.join(quality_issues)}. Cleaning required before modeling.",
+            "score": score,
+            "observation": f"Found {len(quality_issues)} data quality problems",
+            "why_matters": "Poor data quality can lead to unreliable analysis and biased models",
+            "action": "Remove duplicates and impute or remove missing values"
+        })
+
+    # Priority 2: Outlier Analysis
+    outlier_cols = []
+    for row in stats_summary:
+        outlier_ratio = row.get("outlier_ratio", 0.0)
+        if outlier_ratio > 0.05:  # More than 5% outliers
+            outlier_cols.append((row["column"], outlier_ratio))
+    if outlier_cols:
+        top_outlier = max(outlier_cols, key=lambda x: x[1])
+        impact = 0.8  # High impact
+        confidence = calculate_confidence(0.8, top_outlier[1])  # Confidence based on outlier ratio
+        score = impact * confidence
+        insights.append({
+            "text": f"Outlier detection: '{top_outlier[0]}' has {top_outlier[1]:.1%} outliers (IQR method). Consider robust statistics or outlier treatment.",
+            "score": score,
+            "observation": f"Column '{top_outlier[0]}' shows significant outlier presence",
+            "why_matters": "Outliers can distort statistical measures and model performance",
+            "action": "Use robust statistics, remove outliers, or apply transformations"
+        })
+
+    # Priority 3: Skewness Analysis
+    skew_cols = []
+    for row in stats_summary:
+        skew = abs(row.get("skewness", 0.0))
+        if skew > 1.0:
+            skew_cols.append((row["column"], skew))
+    if skew_cols:
+        top_skew = max(skew_cols, key=lambda x: x[1])
+        impact = 0.8  # High impact
+        confidence = calculate_confidence(0.9, min(1.0, top_skew[1] / 5))  # Confidence based on skew magnitude
+        score = impact * confidence
+        direction = "right-skewed" if top_skew[1] > 0 else "left-skewed"
+        insights.append({
+            "text": f"Skewness alert: '{top_skew[0]}' is highly {direction} (skewness={top_skew[1]:.2f}). Consider log transformation or non-parametric methods.",
+            "score": score,
+            "observation": f"Column '{top_skew[0]}' shows asymmetric distribution",
+            "why_matters": "Skewed data can violate statistical assumptions and affect model accuracy",
+            "action": "Apply log transformation, use non-parametric methods, or normalize the data"
+        })
+
+    # Priority 4: Correlation Analysis
+    neg_pairs = []
+    pos_pairs = []
+    if isinstance(corr_df, pd.DataFrame) and not corr_df.empty:
+        for i, row in corr_df.iterrows():
+            for j, value in row.items():
+                if i < j and abs(value) >= 0.6:
+                    if value > 0:
+                        pos_pairs.append((i, j, value))
+                    else:
+                        neg_pairs.append((i, j, value))
+    if neg_pairs or pos_pairs:
+        if neg_pairs:
+            top_corr = min(neg_pairs, key=lambda x: x[2])
+            corr_type = "negative"
+            corr_desc = "inverse relationship"
+        else:
+            top_corr = max(pos_pairs, key=lambda x: x[2])
+            corr_type = "positive"
+            corr_desc = "direct relationship"
+        
+        impact = 0.8  # High impact
+        confidence = calculate_confidence(0.85, abs(top_corr[2]))  # Confidence based on correlation strength
+        score = impact * confidence
+        insights.append({
+            "text": f"Strong {corr_type} correlation: {top_corr[0]} and {top_corr[1]} show {corr_desc} (r={top_corr[2]:.2f}).",
+            "score": score,
+            "observation": f"Columns '{top_corr[0]}' and '{top_corr[1]}' are strongly correlated",
+            "why_matters": "Correlated features can cause multicollinearity in models",
+            "action": "Consider feature selection, PCA, or domain knowledge to handle correlation"
+        })
+
+    # Additional insights if we have space
+    if len(insights) < 3:
+        # Identifier columns detected and excluded
+        identifiers = semantics.get("identifier", [])
+        if identifiers:
+            impact = 0.4  # Lower impact
+            confidence = calculate_confidence(0.95, 1.0)  # High confidence in detection
+            score = impact * confidence
+            id_reasons = semantics.get("identifier_reasons", {})
+            reason_strs = []
+            for col in identifiers:
+                reasons = id_reasons.get(col, [])
+                reason_strs.append(f"{col} ({', '.join(reasons)})")
+            insights.append({
+                "text": f"Identifier columns detected and excluded: {', '.join(reason_strs)}. These represent row identifiers, not predictive features.",
+                "score": score,
+                "observation": f"Found {len(identifiers)} identifier columns",
+                "why_matters": "Including identifiers can lead to data leakage and poor generalization",
+                "action": "Exclude these columns from modeling and analysis"
+            })
+
+    if len(insights) < 3:
+        # Business concentration risk
+        dominant_cat = semantics.get("dominant_categories", {})
+        if dominant_cat:
+            top_cat_col = max(dominant_cat.items(), key=lambda x: x[1][1])
+            if top_cat_col[1][1] > 0.5:
+                impact = 0.5  # Medium impact
+                confidence = calculate_confidence(0.8, top_cat_col[1][1])  # Confidence based on dominance ratio
+                score = impact * confidence
+                insights.append({
+                    "text": f"Business concentration risk: {top_cat_col[0]} dominated by '{top_cat_col[1][0]}' ({top_cat_col[1][1]:.0%}). Diversification recommended.",
+                    "score": score,
+                    "observation": f"Column '{top_cat_col[0]}' shows high concentration in one category",
+                    "why_matters": "High concentration can indicate business risk or data imbalance",
+                    "action": "Monitor concentration trends and consider diversification strategies"
+                })
+
+    if dataset_type == "feature_dataset":
+        insights.append({
+            "text": "Dataset is feature-centric: focus on distributions and relationships rather than grouping.",
+            "score": 0.5,
+            "observation": "No categorical grouping or time dimension available",
+            "why_matters": "Feature datasets are best analyzed through distributions, correlations, and feature importance",
+            "action": "Focus on feature relationships and distribution diagnostics"
+        })
 
     if not insights:
-        insights.append("Dataset is clean, well-distributed, and ready for advanced analytics.")
+        insights.append({
+            "text": "Dataset is clean, well-distributed, and ready for advanced analytics.",
+            "score": 0.1,
+            "observation": "No significant issues detected",
+            "why_matters": "Clean data enables reliable analysis",
+            "action": "Proceed with modeling and analysis"
+        })
 
-    return insights[:3]
+    # Sort by score and return top 3
+    insights.sort(key=lambda x: x["score"], reverse=True)
+    return [insight["text"] for insight in insights[:3]]
 
 
 def run_pipeline(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -181,6 +298,9 @@ def run_pipeline(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
                 dominant_categories[col] = (top_value, ratio)
     report["column_semantics"]["dominant_categories"] = dominant_categories
     
+    dataset_type = classify_dataset(df_clean, schema, column_semantics)
+    report["dataset_type"] = dataset_type
+
     # Temporal anomaly detection
     if datetime_col:
         anomalies = detect_temporal_anomalies(df_clean, date_col=datetime_col)

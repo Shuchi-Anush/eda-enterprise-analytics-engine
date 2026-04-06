@@ -199,61 +199,64 @@ def find_datetime_column(df: pd.DataFrame, hint: Optional[Sequence[str]] = None)
 
 
 def infer_column_semantics(df: pd.DataFrame, schema: Dict[str, List[str]]) -> Dict[str, Any]:
-    """Infer semantic roles of columns with refined rules: identifier, metric, dimension, datetime.
-    
+    """Infer semantic roles of columns with refined rules: identifiers, metrics, dimensions, temporal.
+
     Rules:
-      - Identifier: Contains 'id'/'postal'/'code' OR cardinality > 90%
-      - Metric: Numeric, not identifier, high variance
-      - Dimension: Categorical, cardinality < 50
-      - Datetime: Already in temporal columns
+      - Identifiers: Contains 'id'/'postal'/'code' OR cardinality > 90%
+      - Metrics: Numeric, not identifier
+      - Dimensions: Categorical, cardinality < 50
+      - Temporal: Schema-detected datetime columns
     """
-    roles = {"target_like": [], "identifier": [], "dimension": [], "metric": [], "identifier_reasons": {}}
-    
-    # Classify all numeric columns
-    all_numeric = schema.get("numeric", [])
-    for col in all_numeric:
+    roles = {
+        "target_like": [],
+        "identifiers": [],
+        "dimensions": [],
+        "metrics": [],
+        "temporal": list(schema.get("datetime", [])),
+        "identifier_reasons": {},
+    }
+
+    metric_candidates: List[str] = []
+    for col in schema.get("numeric", []):
         col_lower = col.lower()
         cardinality = df[col].nunique() / len(df)
-        
-        # Identifier detection: name pattern OR >90% unique
+
         is_id_by_name = any(pattern in col_lower for pattern in ["id", "postal", "code"])
         is_id_by_cardinality = cardinality > 0.9
-        
+
         if is_id_by_name or is_id_by_cardinality:
             reason = []
             if is_id_by_name:
                 reason.append("name_contains_id")
             if is_id_by_cardinality:
                 reason.append(f"high_cardinality_{cardinality:.1%}")
-            roles["identifier"].append(col)
+            roles["identifiers"].append(col)
             roles["identifier_reasons"][col] = reason
         else:
-            roles["metric"].append(col)
-    
-    # Classify categorical columns
+            metric_candidates.append(col)
+
     for col in schema.get("categorical", []):
         unique_count = df[col].nunique()
         cardinality = unique_count / len(df)
-        
-        # Check if high-cardinality categorical should be identifier
+
         if cardinality > 0.9:
-            roles["identifier"].append(col)
+            roles["identifiers"].append(col)
             roles["identifier_reasons"][col] = ["high_cardinality_categorical", f"{cardinality:.1%}"]
         elif unique_count < 50:
-            roles["dimension"].append(col)
-    
-    # Identify target-like columns (high variance + good completeness)
-    if roles["metric"]:
-        metric_vars = df[roles["metric"]].var()
+            roles["dimensions"].append(col)
+
+    roles["metrics"] = list(metric_candidates)
+
+    if roles["metrics"]:
+        metric_vars = df[roles["metrics"]].var()
         median_var = metric_vars.median() if len(metric_vars) > 0 else 0
-        for col in roles["metric"]:
+        for col in roles["metrics"]:
             variance = df[col].var()
             completeness = df[col].notna().mean()
             if variance > median_var and completeness > 0.8:
                 roles["target_like"].append(col)
                 break
 
-    roles["metrics"] = list(roles["metric"])
     return roles
 
 
